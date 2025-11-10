@@ -1,0 +1,28 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo lock (for libraries, this is optional)
+# Cargo.lock
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Environment files (may contain secrets)
+.env
+.env.local
+
+# GCP credentials
+*.json
+!Cargo.toml
+
+# Logs
+*.log
