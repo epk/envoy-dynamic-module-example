@@ -1,29 +1,20 @@
 use crate::error::{StorageError, StorageResult};
 use google_cloud_spanner::client::{Client, ClientConfig};
-use google_cloud_spanner::statement::Statement;
+use google_cloud_spanner::mutation::{insert, update};
+use google_cloud_spanner::value::CommitTimestamp;
 use std::sync::Arc;
 use uuid::Uuid;
 
-const INSERT_SQL: &str = r"
-    INSERT INTO request_mappings
-    (request_id, timestamp)
-    VALUES (@request_id, PENDING_COMMIT_TIMESTAMP())
-";
+const TABLE: &str = "request_mappings";
 
-const UPDATE_RESPONSE_SQL: &str = r"
-    UPDATE request_mappings
-    SET response_timestamp = PENDING_COMMIT_TIMESTAMP()
-    WHERE request_id = @request_id
-";
-
-/// Spanner client wrapper for managing request ID mappings
+/// Spanner client wrapper for managing request ID mappings.
 #[derive(Clone)]
 pub struct SpannerClient {
     client: Arc<Client>,
 }
 
 impl SpannerClient {
-    /// Create a new Spanner client with explicit configuration
+    /// Create a new Spanner client using application-default credentials.
     pub async fn new(
         project_id: impl Into<String>,
         instance_id: impl Into<String>,
@@ -32,16 +23,13 @@ impl SpannerClient {
         let project_id = project_id.into();
         let instance_id = instance_id.into();
         let database_id = database_id.into();
-
         let database =
             format!("projects/{project_id}/instances/{instance_id}/databases/{database_id}");
 
-        // Configure authentication using default credentials
         let config = ClientConfig::default()
             .with_auth()
             .await
-            .map_err(|e| StorageError::Configuration(e.to_string()))?;
-
+            .map_err(|error| StorageError::Configuration(error.to_string()))?;
         let client = Client::new(database, config).await?;
 
         Ok(Self {
@@ -49,57 +37,31 @@ impl SpannerClient {
         })
     }
 
-    /// Insert a request ID mapping into Spanner
-    ///
-    /// This performs a synchronous write and waits for transaction commit.
-    /// The timestamp is automatically set by Spanner using `PENDING_COMMIT_TIMESTAMP()`.
+    /// Insert the request mapping with a server-side commit timestamp.
     pub async fn insert_request_mapping(&self, request_id: Uuid) -> StorageResult<()> {
-        let request_id_str = request_id.to_string();
+        let request_id = request_id.to_string();
+        let commit_timestamp = CommitTimestamp::new();
+        let mutation = insert(
+            TABLE,
+            &["request_id", "timestamp"],
+            &[&request_id, &commit_timestamp],
+        );
 
-        let (_, result) = self
-            .client
-            .read_write_transaction(|tx| {
-                let request_id_str = request_id_str.clone();
-                Box::pin(async move {
-                    let mut stmt = Statement::new(INSERT_SQL);
-                    stmt.add_param("request_id", &request_id_str);
-
-                    tx.update(stmt).await.map_err(|e| {
-                        StorageError::Transaction(format!("Failed to insert request mapping: {e}"))
-                    })?;
-
-                    Ok::<_, StorageError>(())
-                })
-            })
-            .await?;
-
-        Ok(result)
+        self.client.apply(vec![mutation]).await?;
+        Ok(())
     }
 
-    /// Update the response timestamp for a request ID mapping
-    ///
-    /// This performs a synchronous write and waits for transaction commit.
-    /// The response timestamp is automatically set by Spanner using `PENDING_COMMIT_TIMESTAMP()`.
+    /// Update the mapping with a server-side response commit timestamp.
     pub async fn update_response_timestamp(&self, request_id: Uuid) -> StorageResult<()> {
-        let request_id_str = request_id.to_string();
+        let request_id = request_id.to_string();
+        let commit_timestamp = CommitTimestamp::new();
+        let mutation = update(
+            TABLE,
+            &["request_id", "response_timestamp"],
+            &[&request_id, &commit_timestamp],
+        );
 
-        let (_, result) = self
-            .client
-            .read_write_transaction(|tx| {
-                let request_id_str = request_id_str.clone();
-                Box::pin(async move {
-                    let mut stmt = Statement::new(UPDATE_RESPONSE_SQL);
-                    stmt.add_param("request_id", &request_id_str);
-
-                    tx.update(stmt).await.map_err(|e| {
-                        StorageError::Transaction(format!("Failed to update response timestamp: {e}"))
-                    })?;
-
-                    Ok::<_, StorageError>(())
-                })
-            })
-            .await?;
-
-        Ok(result)
+        self.client.apply(vec![mutation]).await?;
+        Ok(())
     }
 }

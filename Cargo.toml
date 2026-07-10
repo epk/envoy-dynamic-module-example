@@ -1,43 +1,35 @@
 [package]
 name = "envoy-spanner-extension"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.97"
 license = "Apache-2.0"
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-# Envoy SDK (v1.35 release)
-envoy-proxy-dynamic-modules-rust-sdk = { git = "https://github.com/envoyproxy/envoy.git", rev = "84305a6cb64bd55aaf606bdd53de7cd6080427a1" }
+# Envoy SDK (v1.38.3 release, dynamic modules ABI v0.1.0)
+envoy-proxy-dynamic-modules-rust-sdk = { git = "https://github.com/envoyproxy/envoy.git", rev = "0ebfcfe5b0484b89ca85b761da9e05ce75dbda8d" }
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
 
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "time"] }
 
 # Google Cloud Spanner
-google-cloud-spanner = { version = "1.4", package = "gcloud-spanner" }
-gcloud-gax = "1.3"
-tonic = "0.14"
+google-cloud-spanner = { version = "1.8.1", package = "gcloud-spanner" }
 
 # UUID generation
-uuid = { version = "1", features = ["v4"] }
-
-# Lazy static initialization
-once_cell = "1.20"
+uuid = { version = "1.23.4", features = ["v4"] }
 
 # Error handling
-thiserror = "2"
-
-# Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2.0.18"
 
 # TLS
-rustls = { version = "0.23", features = ["aws-lc-rs"] }
+rustls = { version = "0.23.41", features = ["aws-lc-rs"] }
 
 [profile.release]
 opt-level = 3

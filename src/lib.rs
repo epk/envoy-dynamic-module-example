@@ -1,150 +1,291 @@
+// Envoy 1.38.3's SDK macro compares its registered factory pointer for idempotence.
+#![allow(unpredictable_function_pointer_comparisons)]
+
 mod error;
 mod spanner;
 
 use envoy_proxy_dynamic_modules_rust_sdk::{
-    abi, declare_init_functions, EnvoyHttpFilter, EnvoyHttpFilterConfig, HttpFilter,
-    HttpFilterConfig,
+    CatchUnwind, EnvoyHttpFilter, EnvoyHttpFilterConfig, EnvoyHttpFilterScheduler, HttpFilter,
+    HttpFilterConfig, abi, declare_init_functions, envoy_log_error, envoy_log_info, envoy_log_warn,
+    is_validation_mode,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use tokio::runtime::{Handle, Runtime};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
+use thiserror::Error;
+use tokio::runtime::{Builder, Handle, Runtime};
 use uuid::Uuid;
 
+use crate::error::StorageError;
 use crate::spanner::SpannerClient;
 
 declare_init_functions!(init, new_filter_config);
 
+const DEFAULT_OPERATION_TIMEOUT_MS: u64 = 10_000;
+const RUNTIME_WORKER_THREADS: usize = 2;
+
 fn init() -> bool {
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return true;
+    }
+
+    if rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .is_err()
+        && rustls::crypto::CryptoProvider::get_default().is_none()
+    {
+        envoy_log_error!("failed to install the rustls AWS-LC crypto provider");
+        return false;
+    }
+
     true
 }
 
 fn new_filter_config<EC: EnvoyHttpFilterConfig, EHF: EnvoyHttpFilter>(
     _envoy_filter_config: &mut EC,
-    _name: &str,
+    name: &str,
     config: &[u8],
-) -> Option<Box<dyn HttpFilterConfig<EC, EHF>>> {
-    FilterConfig::new(std::str::from_utf8(config).unwrap_or("{}"))
-        .map(|c| Box::new(c) as Box<dyn HttpFilterConfig<EC, EHF>>)
+) -> Option<Box<dyn HttpFilterConfig<EHF>>> {
+    if name != "spanner_request_mapper" {
+        envoy_log_error!("unsupported filter name: {name}");
+        return None;
+    }
+
+    // SAFETY: Envoy invokes the config factory on its main thread, as required by this SDK API.
+    let validation_only = unsafe { is_validation_mode() };
+    match FilterConfig::new(config, validation_only) {
+        Ok(config) => Some(Box::new(config)),
+        Err(error) => {
+            envoy_log_error!("failed to create filter config: {error}");
+            None
+        }
+    }
 }
 
-/// Type of Spanner operation
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OperationType {
     Request,
     Response,
 }
 
-/// Tracks in-flight Spanner operations
+impl OperationType {
+    const fn event_bit(self) -> u64 {
+        match self {
+            Self::Request => 0,
+            Self::Response => 1,
+        }
+    }
+
+    const fn from_event_id(event_id: u64) -> Self {
+        if event_id & 1 == 0 {
+            Self::Request
+        } else {
+            Self::Response
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum OperationOutcome {
+    Pending,
+    Succeeded,
+    Failed(String),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PendingOperation {
+    uuid: Uuid,
+    operation_type: OperationType,
+    outcome: OperationOutcome,
+}
+
+/// Results passed from Tokio tasks back to the Envoy worker thread.
 #[derive(Clone)]
 struct PendingRequests {
-    map: Arc<Mutex<HashMap<u64, (Uuid, OperationType)>>>,
-    next_id: Arc<AtomicU64>,
+    map: Arc<Mutex<HashMap<u64, PendingOperation>>>,
+    next_sequence: Arc<AtomicU64>,
 }
 
 impl PendingRequests {
     fn new() -> Self {
         Self {
             map: Arc::new(Mutex::new(HashMap::new())),
-            next_id: Arc::new(AtomicU64::new(1)),
+            next_sequence: Arc::new(AtomicU64::new(1)),
         }
     }
 
-    fn insert(&self, uuid: Uuid, op_type: OperationType) -> u64 {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.map.lock().unwrap().insert(id, (uuid, op_type));
-        id
+    fn lock(&self) -> MutexGuard<'_, HashMap<u64, PendingOperation>> {
+        self.map.lock().unwrap_or_else(|poisoned| {
+            envoy_log_warn!("recovering a poisoned pending-operation lock");
+            poisoned.into_inner()
+        })
     }
 
-    fn remove(&self, id: u64) -> Option<(Uuid, OperationType)> {
-        self.map.lock().unwrap().remove(&id)
+    fn insert(&self, uuid: Uuid, operation_type: OperationType) -> u64 {
+        let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
+        let event_id = (sequence << 1) | operation_type.event_bit();
+        self.lock().insert(
+            event_id,
+            PendingOperation {
+                uuid,
+                operation_type,
+                outcome: OperationOutcome::Pending,
+            },
+        );
+        event_id
+    }
+
+    fn complete(&self, event_id: u64, result: Result<(), StorageError>) {
+        if let Some(operation) = self.lock().get_mut(&event_id) {
+            operation.outcome = match result {
+                Ok(()) => OperationOutcome::Succeeded,
+                Err(error) => OperationOutcome::Failed(error.to_string()),
+            };
+        }
+    }
+
+    fn remove(&self, event_id: u64) -> Option<PendingOperation> {
+        self.lock().remove(&event_id)
     }
 }
 
-/// Spanner configuration
 #[derive(Deserialize)]
-#[allow(clippy::struct_field_names)]
+#[serde(deny_unknown_fields)]
+struct ModuleConfig {
+    spanner: SpannerConfig,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SpannerConfig {
     project_id: String,
     instance_id: String,
     database_id: String,
+    #[serde(default = "default_operation_timeout_ms")]
+    operation_timeout_ms: u64,
 }
 
-/// Filter configuration (created once at module load)
-#[derive(Deserialize)]
-pub struct FilterConfig {
-    spanner: SpannerConfig,
-    #[serde(skip)]
+const fn default_operation_timeout_ms() -> u64 {
+    DEFAULT_OPERATION_TIMEOUT_MS
+}
+
+#[derive(Debug, Error)]
+enum ConfigError {
+    #[error("invalid JSON: {0}")]
+    Json(#[from] serde_json::Error),
+
+    #[error("failed to create Tokio runtime: {0}")]
+    Runtime(#[from] std::io::Error),
+
+    #[error("failed to initialize Spanner: {0}")]
+    Spanner(#[from] StorageError),
+
+    #[error("spanner.{0} must not be empty")]
+    EmptyField(&'static str),
+
+    #[error("spanner.operation_timeout_ms must be greater than zero")]
+    InvalidTimeout,
+}
+
+/// Immutable configuration shared by all Envoy worker threads.
+struct FilterConfig {
+    runtime: Option<Runtime>,
     spanner_client: Option<Arc<SpannerClient>>,
-    #[serde(skip)]
-    runtime: Option<Handle>,
-    #[serde(skip)]
-    pending: Option<PendingRequests>,
+    operation_timeout: Duration,
 }
 
 impl FilterConfig {
-    fn new(config_json: &str) -> Option<Self> {
-        // Parse config
-        let mut config: Self = serde_json::from_str(config_json).ok()?;
+    fn new(config_json: &[u8], validation_only: bool) -> Result<Self, ConfigError> {
+        let config: ModuleConfig = serde_json::from_slice(config_json)?;
+        for (name, value) in [
+            ("project_id", config.spanner.project_id.as_str()),
+            ("instance_id", config.spanner.instance_id.as_str()),
+            ("database_id", config.spanner.database_id.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(ConfigError::EmptyField(name));
+            }
+        }
+        if config.spanner.operation_timeout_ms == 0 {
+            return Err(ConfigError::InvalidTimeout);
+        }
+        let operation_timeout = Duration::from_millis(config.spanner.operation_timeout_ms);
 
-        // Setup TLS
-        rustls::crypto::aws_lc_rs::default_provider()
-            .install_default()
-            .ok()?;
+        if validation_only {
+            return Ok(Self {
+                runtime: None,
+                spanner_client: None,
+                operation_timeout,
+            });
+        }
 
-        // Setup logging
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-            )
-            .try_init()
-            .ok();
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(RUNTIME_WORKER_THREADS)
+            .thread_name("envoy-spanner")
+            .enable_all()
+            .build()?;
+        let spanner = runtime.block_on(SpannerClient::new(
+            config.spanner.project_id,
+            config.spanner.instance_id,
+            config.spanner.database_id,
+        ))?;
 
-        // Create Tokio runtime
-        let runtime = Runtime::new().ok()?;
-        let handle = runtime.handle().clone();
-
-        // Initialize Spanner with config from YAML
-        let spanner = runtime.block_on(async {
-            SpannerClient::new(
-                &config.spanner.project_id,
-                &config.spanner.instance_id,
-                &config.spanner.database_id,
-            )
-            .await
-            .ok()
-        })?;
-
-        // Keep runtime alive
-        std::mem::forget(runtime);
-
-        config.spanner_client = Some(Arc::new(spanner));
-        config.runtime = Some(handle);
-        config.pending = Some(PendingRequests::new());
-
-        Some(config)
-    }
-}
-
-impl<EC: EnvoyHttpFilterConfig, EHF: EnvoyHttpFilter> HttpFilterConfig<EC, EHF> for FilterConfig {
-    fn new_http_filter(&mut self, _: &mut EC) -> Box<dyn HttpFilter<EHF>> {
-        Box::new(Filter {
-            spanner: self.spanner_client.clone().unwrap(),
-            runtime: self.runtime.clone().unwrap(),
-            pending: self.pending.clone().unwrap(),
-            request_id: None,
+        Ok(Self {
+            runtime: Some(runtime),
+            spanner_client: Some(Arc::new(spanner)),
+            operation_timeout,
         })
     }
 }
 
-/// Per-request filter instance
-pub struct Filter {
+impl Drop for FilterConfig {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_timeout(Duration::from_secs(5));
+        }
+    }
+}
+
+impl<EHF: EnvoyHttpFilter> HttpFilterConfig<EHF> for FilterConfig {
+    fn new_http_filter(&self, _: &mut EHF) -> Box<dyn HttpFilter<EHF>> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .expect("validation-only config cannot create filters");
+        let spanner = self
+            .spanner_client
+            .as_ref()
+            .expect("validation-only config cannot create filters");
+
+        Box::new(CatchUnwind::new(Filter {
+            spanner: Arc::clone(spanner),
+            runtime: runtime.handle().clone(),
+            pending: PendingRequests::new(),
+            request_id: None,
+            operation_timeout: self.operation_timeout,
+        }))
+    }
+}
+
+/// Per-request filter instance. Envoy invokes all of its callbacks on one worker thread.
+struct Filter {
     spanner: Arc<SpannerClient>,
     runtime: Handle,
     pending: PendingRequests,
     request_id: Option<Uuid>,
+    operation_timeout: Duration,
+}
+
+impl Filter {
+    fn continue_after_missing_event<EHF: EnvoyHttpFilter>(envoy_filter: &mut EHF, event_id: u64) {
+        envoy_log_error!("no pending operation for scheduled event {event_id}");
+        match OperationType::from_event_id(event_id) {
+            OperationType::Request => envoy_filter.continue_decoding(),
+            OperationType::Response => envoy_filter.continue_encoding(),
+        }
+    }
 }
 
 impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for Filter {
@@ -156,44 +297,63 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for Filter {
         let uuid = Uuid::new_v4();
         let event_id = self.pending.insert(uuid, OperationType::Request);
         let scheduler = envoy_filter.new_scheduler();
-
-        // Spawn async Spanner write
-        let spanner = self.spanner.clone();
+        let spanner = Arc::clone(&self.spanner);
         let pending = self.pending.clone();
+        let timeout = self.operation_timeout;
+
         self.runtime.spawn(async move {
-            match spanner.insert_request_mapping(uuid).await {
-                Ok(()) => {
-                    tracing::info!("Inserted {uuid}, scheduling callback");
-                    scheduler.commit(event_id);
-                }
-                Err(e) => {
-                    tracing::error!("Spanner insert failed for {uuid}: {e}");
-                    pending.remove(event_id);
-                    scheduler.commit(event_id); // Continue anyway
-                }
-            }
+            let result = tokio::time::timeout(timeout, spanner.insert_request_mapping(uuid))
+                .await
+                .unwrap_or(Err(StorageError::Timeout(timeout)));
+            pending.complete(event_id, result);
+            scheduler.commit(event_id);
         });
 
-        abi::envoy_dynamic_module_type_on_http_filter_request_headers_status::StopIteration
+        abi::envoy_dynamic_module_type_on_http_filter_request_headers_status::StopAllIterationAndWatermark
     }
 
     fn on_scheduled(&mut self, envoy_filter: &mut EHF, event_id: u64) {
-        if let Some((uuid, op_type)) = self.pending.remove(event_id) {
-            match op_type {
-                OperationType::Request => {
-                    envoy_filter.set_request_header("x-request-id", uuid.to_string().as_bytes());
-                    self.request_id = Some(uuid);
-                    tracing::info!("Set header {uuid} after Spanner commit");
-                    envoy_filter.continue_decoding();
+        let Some(operation) = self.pending.remove(event_id) else {
+            Self::continue_after_missing_event(envoy_filter, event_id);
+            return;
+        };
+
+        match (operation.operation_type, operation.outcome) {
+            (OperationType::Request, OperationOutcome::Succeeded) => {
+                self.request_id = Some(operation.uuid);
+                if !envoy_filter
+                    .set_request_header("x-request-id", operation.uuid.to_string().as_bytes())
+                {
+                    envoy_log_error!("failed to set x-request-id for {}", operation.uuid);
                 }
-                OperationType::Response => {
-                    tracing::info!("Response timestamp written for {uuid}, continuing response");
-                    envoy_filter.continue_encoding();
+                envoy_log_info!("stored request mapping for {}", operation.uuid);
+                envoy_filter.continue_decoding();
+            }
+            (OperationType::Request, OperationOutcome::Failed(error)) => {
+                envoy_log_error!(
+                    "failed to store request mapping for {}: {error}",
+                    operation.uuid
+                );
+                envoy_filter.continue_decoding();
+            }
+            (OperationType::Response, OperationOutcome::Succeeded) => {
+                envoy_log_info!("stored response timestamp for {}", operation.uuid);
+                envoy_filter.continue_encoding();
+            }
+            (OperationType::Response, OperationOutcome::Failed(error)) => {
+                envoy_log_error!(
+                    "failed to store response timestamp for {}: {error}",
+                    operation.uuid
+                );
+                envoy_filter.continue_encoding();
+            }
+            (operation_type, OperationOutcome::Pending) => {
+                envoy_log_error!("scheduled event {event_id} ran before its operation completed");
+                match operation_type {
+                    OperationType::Request => envoy_filter.continue_decoding(),
+                    OperationType::Response => envoy_filter.continue_encoding(),
                 }
             }
-        } else {
-            tracing::warn!("No pending operation for event {event_id}");
-            envoy_filter.continue_decoding();
         }
     }
 
@@ -202,30 +362,25 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for Filter {
         envoy_filter: &mut EHF,
         _: bool,
     ) -> abi::envoy_dynamic_module_type_on_http_filter_response_headers_status {
-        if let Some(uuid) = self.request_id {
-            let event_id = self.pending.insert(uuid, OperationType::Response);
-            let scheduler = envoy_filter.new_scheduler();
-            let spanner = self.spanner.clone();
-            let pending = self.pending.clone();
+        let Some(uuid) = self.request_id else {
+            return abi::envoy_dynamic_module_type_on_http_filter_response_headers_status::Continue;
+        };
 
-            self.runtime.spawn(async move {
-                match spanner.update_response_timestamp(uuid).await {
-                    Ok(()) => {
-                        tracing::info!("Updated response timestamp for {uuid}, scheduling callback");
-                        scheduler.commit(event_id);
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to update response timestamp for {uuid}: {e}");
-                        pending.remove(event_id);
-                        scheduler.commit(event_id); // Continue anyway
-                    }
-                }
-            });
+        let event_id = self.pending.insert(uuid, OperationType::Response);
+        let scheduler = envoy_filter.new_scheduler();
+        let spanner = Arc::clone(&self.spanner);
+        let pending = self.pending.clone();
+        let timeout = self.operation_timeout;
 
-            abi::envoy_dynamic_module_type_on_http_filter_response_headers_status::StopIteration
-        } else {
-            abi::envoy_dynamic_module_type_on_http_filter_response_headers_status::Continue
-        }
+        self.runtime.spawn(async move {
+            let result = tokio::time::timeout(timeout, spanner.update_response_timestamp(uuid))
+                .await
+                .unwrap_or(Err(StorageError::Timeout(timeout)));
+            pending.complete(event_id, result);
+            scheduler.commit(event_id);
+        });
+
+        abi::envoy_dynamic_module_type_on_http_filter_response_headers_status::StopAllIterationAndWatermark
     }
 }
 
@@ -234,11 +389,83 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_pending_requests() {
+    fn pending_requests_carry_results_back_to_the_correct_path() {
         let pending = PendingRequests::new();
-        let uuid = Uuid::new_v4();
-        let id = pending.insert(uuid, OperationType::Request);
-        assert_eq!(pending.remove(id), Some((uuid, OperationType::Request)));
-        assert_eq!(pending.remove(id), None);
+        let request_uuid = Uuid::new_v4();
+        let request_event = pending.insert(request_uuid, OperationType::Request);
+        let response_uuid = Uuid::new_v4();
+        let response_event = pending.insert(response_uuid, OperationType::Response);
+
+        pending.complete(request_event, Ok(()));
+
+        assert_eq!(
+            pending.remove(request_event),
+            Some(PendingOperation {
+                uuid: request_uuid,
+                operation_type: OperationType::Request,
+                outcome: OperationOutcome::Succeeded,
+            })
+        );
+        assert_eq!(
+            OperationType::from_event_id(request_event),
+            OperationType::Request
+        );
+        assert_eq!(
+            OperationType::from_event_id(response_event),
+            OperationType::Response
+        );
+    }
+
+    #[test]
+    fn config_validation_does_not_initialize_external_services() {
+        let config = r#"{
+            "spanner": {
+                "project_id": "project",
+                "instance_id": "instance",
+                "database_id": "database"
+            }
+        }"#;
+
+        let config = FilterConfig::new(config.as_bytes(), true).unwrap();
+
+        assert!(config.runtime.is_none());
+        assert!(config.spanner_client.is_none());
+        assert_eq!(
+            config.operation_timeout,
+            Duration::from_millis(DEFAULT_OPERATION_TIMEOUT_MS)
+        );
+    }
+
+    #[test]
+    fn config_rejects_unknown_fields() {
+        let config = r#"{
+            "spanner": {
+                "project_id": "project",
+                "instance_id": "instance",
+                "database_id": "database",
+                "typo": true
+            }
+        }"#;
+
+        assert!(matches!(
+            FilterConfig::new(config.as_bytes(), true),
+            Err(ConfigError::Json(_))
+        ));
+    }
+
+    #[test]
+    fn config_rejects_empty_spanner_identifiers() {
+        let config = br#"{
+            "spanner": {
+                "project_id": "",
+                "instance_id": "instance",
+                "database_id": "database"
+            }
+        }"#;
+
+        assert!(matches!(
+            FilterConfig::new(config, true),
+            Err(ConfigError::EmptyField("project_id"))
+        ));
     }
 }

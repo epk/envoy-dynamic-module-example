@@ -1,17 +1,30 @@
 # Envoy Spanner Extension
 
-Proof of concept Envoy Dynamic Module (v1.35+) that:
-- Generates UUIDv4 for each request
-- Writes request/response timestamps to Google Cloud Spanner
-- Adds `x-request-id` header after async Spanner commit
+Proof-of-concept HTTP filter built against Envoy 1.38.3 and dynamic modules ABI v0.1.0. It:
+
+- Generates a UUIDv4 for each request
+- Writes request and response timestamps to Google Cloud Spanner
+- Adds `x-request-id` after the request mapping commits
+
+Envoy dynamic modules have strict compatibility requirements. The Rust SDK revision in
+`Cargo.toml` exactly matches Envoy 1.38.3; rebuild the module whenever the target Envoy minor
+version changes.
 
 ## Prerequisites
 
+- Rust 1.97.0 (pinned by `rust-toolchain.toml`)
+- Envoy 1.38.3
+- Google application-default credentials with access to the configured Spanner database
+
+On macOS, the current Homebrew formula installs the matching Envoy release:
+
 ```bash
 brew install envoy
+envoy --version
 ```
 
-Spanner table:
+Create the Spanner table:
+
 ```sql
 CREATE TABLE request_mappings (
   request_id STRING(36) NOT NULL,
@@ -20,24 +33,48 @@ CREATE TABLE request_mappings (
 ) PRIMARY KEY (request_id);
 ```
 
-## Build
+Update the Spanner identifiers in `envoy-config.yaml`, then build the module:
+
+`operation_timeout_ms` bounds each request or response write so a stalled Spanner operation cannot
+leave the Envoy stream paused indefinitely. It defaults to 10 seconds.
 
 ```bash
-cargo build --release
+cargo build --release --locked
 ```
 
-## Run
+Envoy discovers dynamic modules as `lib{name}.so`. Cargo uses the `.dylib` suffix on macOS, so
+create the expected symlink once after building:
+
+```bash
+ln -sf libenvoy_spanner_extension.dylib \
+  target/release/libenvoy_spanner_extension.so
+```
+
+Validate the module and configuration without contacting Spanner:
 
 ```bash
 ENVOY_DYNAMIC_MODULES_SEARCH_PATH=target/release \
-RUST_LOG=info \
-envoy -c envoy-config.yaml
+envoy --mode validate -c envoy-config.yaml
 ```
 
-## Test
+Run Envoy:
+
+```bash
+ENVOY_DYNAMIC_MODULES_SEARCH_PATH=target/release \
+envoy --log-level info -c envoy-config.yaml
+```
+
+Send a request:
 
 ```bash
 curl -v http://localhost:10000/get
 ```
 
-Check logs for UUID and Spanner commits. Verify in Spanner console.
+Check the Envoy `dynamic_modules` logs for the UUID and Spanner commits, then verify the row in
+Spanner.
+
+## Test
+
+```bash
+cargo test --locked
+```
