@@ -2,13 +2,17 @@
 #![allow(unpredictable_function_pointer_comparisons)]
 
 mod error;
+mod exporter;
 mod spanner;
+mod telemetry;
 
 use envoy_proxy_dynamic_modules_rust_sdk::{
-    CatchUnwind, EnvoyHttpFilter, EnvoyHttpFilterConfig, EnvoyHttpFilterScheduler, HttpFilter,
-    HttpFilterConfig, abi, declare_init_functions, envoy_log_error, envoy_log_info, envoy_log_warn,
-    is_validation_mode,
+    CatchUnwind, EnvoyBuffer, EnvoyHttpFilter, EnvoyHttpFilterConfig, EnvoyHttpFilterScheduler,
+    HttpFilter, HttpFilterConfig, abi, declare_init_functions, envoy_log_error, envoy_log_info,
+    envoy_log_warn, is_validation_mode,
 };
+use opentelemetry::Context;
+use opentelemetry_sdk::trace::SdkTracer;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -155,6 +159,7 @@ impl PendingRequests {
 #[serde(deny_unknown_fields)]
 struct ModuleConfig {
     spanner: SpannerConfig,
+    opentelemetry: exporter::Config,
 }
 
 #[derive(Deserialize)]
@@ -182,7 +187,10 @@ enum ConfigError {
     #[error("failed to initialize Spanner: {0}")]
     Spanner(#[from] StorageError),
 
-    #[error("spanner.{0} must not be empty")]
+    #[error("failed to initialize OpenTelemetry: {0}")]
+    OpenTelemetry(#[from] exporter::Error),
+
+    #[error("{0} must not be empty")]
     EmptyField(&'static str),
 
     #[error("spanner.operation_timeout_ms must be greater than zero")]
@@ -193,6 +201,7 @@ enum ConfigError {
 struct FilterConfig {
     runtime: Option<Runtime>,
     spanner_client: Option<Arc<SpannerClient>>,
+    telemetry: Option<exporter::Pipeline>,
     operation_timeout: Duration,
 }
 
@@ -200,9 +209,9 @@ impl FilterConfig {
     fn new(config_json: &[u8], validation_only: bool) -> Result<Self, ConfigError> {
         let config: ModuleConfig = serde_json::from_slice(config_json)?;
         for (name, value) in [
-            ("project_id", config.spanner.project_id.as_str()),
-            ("instance_id", config.spanner.instance_id.as_str()),
-            ("database_id", config.spanner.database_id.as_str()),
+            ("spanner.project_id", config.spanner.project_id.as_str()),
+            ("spanner.instance_id", config.spanner.instance_id.as_str()),
+            ("spanner.database_id", config.spanner.database_id.as_str()),
         ] {
             if value.trim().is_empty() {
                 return Err(ConfigError::EmptyField(name));
@@ -211,12 +220,14 @@ impl FilterConfig {
         if config.spanner.operation_timeout_ms == 0 {
             return Err(ConfigError::InvalidTimeout);
         }
+        config.opentelemetry.validate()?;
         let operation_timeout = Duration::from_millis(config.spanner.operation_timeout_ms);
 
         if validation_only {
             return Ok(Self {
                 runtime: None,
                 spanner_client: None,
+                telemetry: None,
                 operation_timeout,
             });
         }
@@ -231,10 +242,15 @@ impl FilterConfig {
             config.spanner.instance_id,
             config.spanner.database_id,
         ))?;
+        let telemetry = {
+            let _runtime_guard = runtime.enter();
+            exporter::Pipeline::new(config.opentelemetry)?
+        };
 
         Ok(Self {
             runtime: Some(runtime),
             spanner_client: Some(Arc::new(spanner)),
+            telemetry: Some(telemetry),
             operation_timeout,
         })
     }
@@ -242,6 +258,11 @@ impl FilterConfig {
 
 impl Drop for FilterConfig {
     fn drop(&mut self) {
+        if let Some(telemetry) = self.telemetry.take()
+            && let Err(error) = telemetry.shutdown(Duration::from_secs(2))
+        {
+            envoy_log_warn!("failed to shut down OpenTelemetry cleanly: {error}");
+        }
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown_timeout(Duration::from_secs(5));
         }
@@ -258,6 +279,10 @@ impl<EHF: EnvoyHttpFilter> HttpFilterConfig<EHF> for FilterConfig {
             .spanner_client
             .as_ref()
             .expect("validation-only config cannot create filters");
+        let telemetry = self
+            .telemetry
+            .as_ref()
+            .expect("validation-only config cannot create filters");
 
         Box::new(CatchUnwind::new(Filter {
             spanner: Arc::clone(spanner),
@@ -265,6 +290,10 @@ impl<EHF: EnvoyHttpFilter> HttpFilterConfig<EHF> for FilterConfig {
             pending: PendingRequests::new(),
             request_id: None,
             operation_timeout: self.operation_timeout,
+            tracer: telemetry.tracer(),
+            exporter: telemetry.new_handle(),
+            parent_context: None,
+            deferred_operation: None,
         }))
     }
 }
@@ -276,6 +305,10 @@ struct Filter {
     pending: PendingRequests,
     request_id: Option<Uuid>,
     operation_timeout: Duration,
+    tracer: SdkTracer,
+    exporter: exporter::Handle,
+    parent_context: Option<Context>,
+    deferred_operation: Option<(u64, PendingOperation)>,
 }
 
 impl Filter {
@@ -286,38 +319,13 @@ impl Filter {
             OperationType::Response => envoy_filter.continue_encoding(),
         }
     }
-}
 
-impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for Filter {
-    fn on_request_headers(
+    fn finish_operation<EHF: EnvoyHttpFilter>(
         &mut self,
         envoy_filter: &mut EHF,
-        _: bool,
-    ) -> abi::envoy_dynamic_module_type_on_http_filter_request_headers_status {
-        let uuid = Uuid::new_v4();
-        let event_id = self.pending.insert(uuid, OperationType::Request);
-        let scheduler = envoy_filter.new_scheduler();
-        let spanner = Arc::clone(&self.spanner);
-        let pending = self.pending.clone();
-        let timeout = self.operation_timeout;
-
-        self.runtime.spawn(async move {
-            let result = tokio::time::timeout(timeout, spanner.insert_request_mapping(uuid))
-                .await
-                .unwrap_or(Err(StorageError::Timeout(timeout)));
-            pending.complete(event_id, result);
-            scheduler.commit(event_id);
-        });
-
-        abi::envoy_dynamic_module_type_on_http_filter_request_headers_status::StopAllIterationAndWatermark
-    }
-
-    fn on_scheduled(&mut self, envoy_filter: &mut EHF, event_id: u64) {
-        let Some(operation) = self.pending.remove(event_id) else {
-            Self::continue_after_missing_event(envoy_filter, event_id);
-            return;
-        };
-
+        event_id: u64,
+        operation: PendingOperation,
+    ) {
         match (operation.operation_type, operation.outcome) {
             (OperationType::Request, OperationOutcome::Succeeded) => {
                 self.request_id = Some(operation.uuid);
@@ -356,6 +364,61 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for Filter {
             }
         }
     }
+}
+
+impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for Filter {
+    fn on_request_headers(
+        &mut self,
+        envoy_filter: &mut EHF,
+        _: bool,
+    ) -> abi::envoy_dynamic_module_type_on_http_filter_request_headers_status {
+        let uuid = Uuid::new_v4();
+        let event_id = self.pending.insert(uuid, OperationType::Request);
+        let scheduler = envoy_filter.new_scheduler();
+        let spanner = Arc::clone(&self.spanner);
+        let pending = self.pending.clone();
+        let timeout = self.operation_timeout;
+        self.parent_context = match telemetry::active_parent_context(envoy_filter) {
+            Ok(context) => Some(context),
+            Err(error) => {
+                envoy_log_warn!("cannot create Spanner child span: {error}");
+                None
+            }
+        };
+        let span = self.parent_context.as_ref().map(|parent| {
+            telemetry::start_spanner_span(
+                &self.tracer,
+                parent,
+                "spanner.insert_request_mapping",
+                "INSERT",
+                uuid,
+            )
+        });
+
+        self.runtime.spawn(async move {
+            let result = tokio::time::timeout(timeout, spanner.insert_request_mapping(uuid))
+                .await
+                .unwrap_or(Err(StorageError::Timeout(timeout)));
+            telemetry::finish_span(span, &result);
+            pending.complete(event_id, result);
+            scheduler.commit(event_id);
+        });
+
+        abi::envoy_dynamic_module_type_on_http_filter_request_headers_status::StopAllIterationAndWatermark
+    }
+
+    fn on_scheduled(&mut self, envoy_filter: &mut EHF, event_id: u64) {
+        let Some(operation) = self.pending.remove(event_id) else {
+            Self::continue_after_missing_event(envoy_filter, event_id);
+            return;
+        };
+
+        if self.exporter.export_pending(envoy_filter) {
+            self.deferred_operation = Some((event_id, operation));
+        } else {
+            self.finish_operation(envoy_filter, event_id, operation);
+        }
+    }
 
     fn on_response_headers(
         &mut self,
@@ -371,16 +434,43 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for Filter {
         let spanner = Arc::clone(&self.spanner);
         let pending = self.pending.clone();
         let timeout = self.operation_timeout;
+        let span = self.parent_context.as_ref().map(|parent| {
+            telemetry::start_spanner_span(
+                &self.tracer,
+                parent,
+                "spanner.update_response_timestamp",
+                "UPDATE",
+                uuid,
+            )
+        });
 
         self.runtime.spawn(async move {
             let result = tokio::time::timeout(timeout, spanner.update_response_timestamp(uuid))
                 .await
                 .unwrap_or(Err(StorageError::Timeout(timeout)));
+            telemetry::finish_span(span, &result);
             pending.complete(event_id, result);
             scheduler.commit(event_id);
         });
 
         abi::envoy_dynamic_module_type_on_http_filter_response_headers_status::StopAllIterationAndWatermark
+    }
+
+    fn on_http_callout_done(
+        &mut self,
+        envoy_filter: &mut EHF,
+        callout_id: u64,
+        result: abi::envoy_dynamic_module_type_http_callout_result,
+        response_headers: Option<&[(EnvoyBuffer, EnvoyBuffer)]>,
+        _response_body: Option<&[EnvoyBuffer]>,
+    ) {
+        if self
+            .exporter
+            .on_http_callout_done(callout_id, result, response_headers)
+            && let Some((event_id, operation)) = self.deferred_operation.take()
+        {
+            self.finish_operation(envoy_filter, event_id, operation);
+        }
     }
 }
 
@@ -423,6 +513,13 @@ mod tests {
                 "project_id": "project",
                 "instance_id": "instance",
                 "database_id": "database"
+            },
+            "opentelemetry": {
+                "service_name": "envoy-spanner-poc",
+                "exporter": {
+                    "type": "direct_grpc",
+                    "grpc_endpoint": "http://127.0.0.1:4317"
+                }
             }
         }"#;
 
@@ -430,6 +527,7 @@ mod tests {
 
         assert!(config.runtime.is_none());
         assert!(config.spanner_client.is_none());
+        assert!(config.telemetry.is_none());
         assert_eq!(
             config.operation_timeout,
             Duration::from_millis(DEFAULT_OPERATION_TIMEOUT_MS)
@@ -444,6 +542,13 @@ mod tests {
                 "instance_id": "instance",
                 "database_id": "database",
                 "typo": true
+            },
+            "opentelemetry": {
+                "service_name": "envoy-spanner-poc",
+                "exporter": {
+                    "type": "direct_grpc",
+                    "grpc_endpoint": "http://127.0.0.1:4317"
+                }
             }
         }"#;
 
@@ -460,12 +565,19 @@ mod tests {
                 "project_id": "",
                 "instance_id": "instance",
                 "database_id": "database"
+            },
+            "opentelemetry": {
+                "service_name": "envoy-spanner-poc",
+                "exporter": {
+                    "type": "envoy_grpc_callout",
+                    "cluster": "otel_collector_grpc"
+                }
             }
         }"#;
 
         assert!(matches!(
             FilterConfig::new(config, true),
-            Err(ConfigError::EmptyField("project_id"))
+            Err(ConfigError::EmptyField("spanner.project_id"))
         ));
     }
 }
