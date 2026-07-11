@@ -64,7 +64,8 @@ network connection:
 - `direct_grpc` (the default in `envoy-config.yaml`) lets the Rust OpenTelemetry SDK dial the
   collector directly.
 - `envoy_grpc_callout` sends the same OTLP/gRPC request through Envoy's
-  `otel_collector_grpc` cluster, so Envoy owns the connection.
+  `otel_collector_grpc` cluster, so Envoy owns the connection. It uses the streaming HTTP callout
+  ABI so the module can validate the final gRPC status from the response trailers.
 
 Span creation is identical in both modes. Export selection lives in `src/exporter.rs`, the two
 implementations live in `src/exporter/direct.rs` and `src/exporter/envoy.rs`, and the callout

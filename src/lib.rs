@@ -364,6 +364,12 @@ impl Filter {
             }
         }
     }
+
+    fn finish_deferred_export<EHF: EnvoyHttpFilter>(&mut self, envoy_filter: &mut EHF) {
+        if let Some((event_id, operation)) = self.deferred_operation.take() {
+            self.finish_operation(envoy_filter, event_id, operation);
+        }
+    }
 }
 
 impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for Filter {
@@ -456,20 +462,44 @@ impl<EHF: EnvoyHttpFilter> HttpFilter<EHF> for Filter {
         abi::envoy_dynamic_module_type_on_http_filter_response_headers_status::StopAllIterationAndWatermark
     }
 
-    fn on_http_callout_done(
+    fn on_http_stream_headers(
+        &mut self,
+        _envoy_filter: &mut EHF,
+        stream_handle: u64,
+        response_headers: &[(EnvoyBuffer, EnvoyBuffer)],
+        end_stream: bool,
+    ) {
+        self.exporter
+            .on_http_stream_headers(stream_handle, response_headers, end_stream);
+    }
+
+    fn on_http_stream_trailers(
+        &mut self,
+        _envoy_filter: &mut EHF,
+        stream_handle: u64,
+        response_trailers: &[(EnvoyBuffer, EnvoyBuffer)],
+    ) {
+        self.exporter
+            .on_http_stream_trailers(stream_handle, response_trailers);
+    }
+
+    fn on_http_stream_complete(&mut self, envoy_filter: &mut EHF, stream_handle: u64) {
+        if self.exporter.on_http_stream_complete(stream_handle) {
+            self.finish_deferred_export(envoy_filter);
+        }
+    }
+
+    fn on_http_stream_reset(
         &mut self,
         envoy_filter: &mut EHF,
-        callout_id: u64,
-        result: abi::envoy_dynamic_module_type_http_callout_result,
-        response_headers: Option<&[(EnvoyBuffer, EnvoyBuffer)]>,
-        _response_body: Option<&[EnvoyBuffer]>,
+        stream_handle: u64,
+        reset_reason: abi::envoy_dynamic_module_type_http_stream_reset_reason,
     ) {
         if self
             .exporter
-            .on_http_callout_done(callout_id, result, response_headers)
-            && let Some((event_id, operation)) = self.deferred_operation.take()
+            .on_http_stream_reset(stream_handle, reset_reason)
         {
-            self.finish_operation(envoy_filter, event_id, operation);
+            self.finish_deferred_export(envoy_filter);
         }
     }
 }
